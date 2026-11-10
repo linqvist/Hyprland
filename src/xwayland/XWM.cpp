@@ -821,12 +821,21 @@ bool CXWM::handleSelectionXFixesNotify(xcb_xfixes_selection_notify_event_t* e) {
         return true;
 
     if (e->owner == XCB_WINDOW_NONE) {
-        if (sel->owner != sel->window) {
+        const auto currentSel     = g_pSeatManager->m_selection.currentSelection;
+        const auto currentPrimSel = g_pSeatManager->m_selection.currentPrimarySelection;
+        const bool waylandHoldsIt = (sel == &m_clipboard && currentSel && currentSel->type() != DATA_SOURCE_TYPE_X11) ||
+            (sel == &m_primarySelection && currentPrimSel && currentPrimSel->type() != DATA_SOURCE_TYPE_X11);
+
+        if (sel->owner != sel->window && !waylandHoldsIt) {
             if (sel == &m_clipboard)
                 g_pSeatManager->setCurrentSelection(nullptr);
             else if (sel == &m_primarySelection)
                 g_pSeatManager->setCurrentPrimarySelection(nullptr);
         }
+
+        sel->exportedSource.reset();
+        if (waylandHoldsIt)
+            sel->notifyOnFocus = true;
 
         sel->owner = 0;
         return true;
@@ -838,6 +847,8 @@ bool CXWM::handleSelectionXFixesNotify(xcb_xfixes_selection_notify_event_t* e) {
         sel->timestamp = e->timestamp;
         return true;
     }
+
+    sel->exportedSource.reset();
 
     if (sel == &m_clipboard)
         xcb_convert_selection(getConnection(), sel->window, HYPRATOMS["CLIPBOARD"], HYPRATOMS["TARGETS"], HYPRATOMS["_WL_SELECTION"], e->timestamp);
@@ -1468,9 +1479,12 @@ SP<IDataOffer> CXWM::createX11DataOffer(SP<CWLSurfaceResource> surf, SP<IDataSou
     return offer;
 }
 
-void SXSelection::onSelection() {
+void SXSelection::onSelection(bool force) {
     const bool isClipboard = this == &g_pXWayland->m_wm->m_clipboard;
     const bool isPrimary   = this == &g_pXWayland->m_wm->m_primarySelection;
+
+    if (!isClipboard && !isPrimary)
+        return;
 
     auto       currentSel     = g_pSeatManager->m_selection.currentSelection;
     auto       currentPrimSel = g_pSeatManager->m_selection.currentPrimarySelection;
@@ -1481,30 +1495,35 @@ void SXSelection::onSelection() {
     if (isX11Clipboard || isX11Primary)
         return;
 
+    const auto source = isClipboard ? currentSel : currentPrimSel;
+    if (!source) {
+        exportedSource.reset();
+        return;
+    }
+
+    // Reasserting an already-exported source makes xfreerdp re-announce it to the RDP server.
+    if (!force && exportedSource.lock() == source)
+        return;
+
     auto conn = g_pXWayland->m_wm->getConnection();
 
-    if (isClipboard && currentSel) {
-        xcb_set_selection_owner(conn, g_pXWayland->m_wm->m_clipboard.window, HYPRATOMS["CLIPBOARD"], XCB_TIME_CURRENT_TIME);
-        xcb_flush(conn);
-        g_pXWayland->m_wm->m_clipboard.notifyOnFocus = true;
-    } else if (isPrimary && currentPrimSel) {
-        xcb_set_selection_owner(conn, g_pXWayland->m_wm->m_primarySelection.window, HYPRATOMS["PRIMARY"], XCB_TIME_CURRENT_TIME);
-        xcb_flush(conn);
-        g_pXWayland->m_wm->m_primarySelection.notifyOnFocus = true;
-    }
+    xcb_set_selection_owner(conn, window, HYPRATOMS[isClipboard ? "CLIPBOARD" : "PRIMARY"], XCB_TIME_CURRENT_TIME);
+    xcb_flush(conn);
+
+    const auto focus = g_pSeatManager->m_state.keyboardFocusResource;
+    exportedSource   = source;
+    notifyOnFocus    = !focus || focus->client() != g_pXWayland->m_server->m_xwaylandClient;
 }
 
 void SXSelection::onKeyboardFocus() {
     if (!g_pSeatManager->m_state.keyboardFocusResource || g_pSeatManager->m_state.keyboardFocusResource->client() != g_pXWayland->m_server->m_xwaylandClient)
         return;
 
-    if (this == &g_pXWayland->m_wm->m_clipboard && g_pXWayland->m_wm->m_clipboard.notifyOnFocus) {
-        onSelection();
-        g_pXWayland->m_wm->m_clipboard.notifyOnFocus = false;
-    } else if (this == &g_pXWayland->m_wm->m_primarySelection && g_pXWayland->m_wm->m_primarySelection.notifyOnFocus) {
-        onSelection();
-        g_pXWayland->m_wm->m_primarySelection.notifyOnFocus = false;
-    }
+    if (!notifyOnFocus)
+        return;
+
+    notifyOnFocus = false;
+    onSelection(true);
 }
 
 int SXSelection::onRead(int fd, uint32_t mask) {

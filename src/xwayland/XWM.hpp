@@ -48,8 +48,9 @@ struct SXSelection {
     xcb_timestamp_t  timestamp = 0;
     SP<CXDataSource> dataSource;
     bool             notifyOnFocus = false;
+    WP<IDataSource>  exportedSource;
 
-    void             onSelection();
+    void             onSelection(bool force = false);
     void             onKeyboardFocus();
     bool             sendData(xcb_selection_request_event_t* e, std::string mime);
     int              onRead(int fd, uint32_t mask);
